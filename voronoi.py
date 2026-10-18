@@ -170,54 +170,111 @@ def delaunay(points: list[Point2D], width: float, height: float) -> list[Triangl
 
 # ---------------------------------------------------------------- voronoi
 
-def clip_segment(p: Point2D, q: Point2D, width: float, height: float) -> Segment2D | None:
-    """Liang-Barsky clipping of segment pq to [0, width] x [0, height]."""
-    dx, dy = q.x - p.x, q.y - p.y
-    t0, t1 = 0.0, 1.0
-    for denom, num in ((-dx, p.x), (dx, width - p.x), (-dy, p.y), (dy, height - p.y)):
-        if denom == 0:
-            if num < 0:
-                return None          # parallel to this border and outside
-            continue
-        t = num / denom
-        if denom < 0:
-            t0 = max(t0, t)          # entering
-        else:
-            t1 = min(t1, t)          # leaving
-        if t0 > t1:
-            return None
-    return Segment2D(p + (q - p) * t0, p + (q - p) * t1)
+@dataclass
+class VoronoiDiagram:
+    """Indexed Voronoi diagram clipped to a [0, width] x [0, height] wall.
 
-
-def voronoi(points: list[Point2D], width: float, height: float) -> list[Segment2D]:
-    """Voronoi edges of points, clipped to the wall rectangle.
-
-    Each Delaunay edge shared by two triangles gives one Voronoi edge between
-    their circumcenters. Triangles touching the super-triangle are kept here:
-    their far-away circumcenters stand in for the infinite rays on the border.
+    vertices is the single source of points; everything else is indices into it.
+    cells[i] is the polygon (counter-clockwise vertex indices) around sites[i].
     """
+    sites: list[Point2D]
+    vertices: list[Point2D]
+    edges: list[Edge]
+    cells: list[list[int]]
+
+    def segments(self) -> list[Segment2D]:
+        """Edges as standalone segments (handy for plotting)."""
+        return [Segment2D(self.vertices[a], self.vertices[b]) for a, b in self.edges]
+
+
+def _clip_polygon(polygon: list[Point2D], width: float, height: float) -> list[Point2D]:
+    """Sutherland-Hodgman clipping of a convex polygon to [0, width] x [0, height]."""
+    # each border as (side value function): inside when value >= 0
+    borders = (
+        lambda p: p.x,            # left
+        lambda p: width - p.x,    # right
+        lambda p: p.y,            # bottom
+        lambda p: height - p.y,   # top
+    )
+    for side in borders:
+        if not polygon:
+            break
+        clipped: list[Point2D] = []
+        for k, cur in enumerate(polygon):
+            nxt = polygon[(k + 1) % len(polygon)]
+            s_cur, s_nxt = side(cur), side(nxt)
+            if s_cur >= 0:
+                clipped.append(cur)
+            if (s_cur >= 0) != (s_nxt >= 0):          # edge crosses the border
+                t = s_cur / (s_cur - s_nxt)
+                clipped.append(cur + (nxt - cur) * t)
+        polygon = clipped
+    return polygon
+
+
+def delaunay_voronoi(points: list[Point2D], width: float, height: float,
+                     decimals: int = 9) -> tuple[list[Triangle], VoronoiDiagram]:
+    """Compute the Delaunay triangulation and the indexed Voronoi diagram in one pass.
+
+    A site's Voronoi cell is the polygon of circumcenters of the triangles around
+    it, sorted by angle. Triangles touching the super-triangle are kept so border
+    cells are closed (far away), then every cell is clipped to the wall.
+    Points created by clipping are shared between neighbouring cells by rounding
+    their coordinates to `decimals` digits.
+    """
+    n = len(points)
     _, triangles = _bowyer_watson(points, width, height)
 
-    edge_to_tris: dict[Edge, list[Triangle]] = defaultdict(list)
+    tris_around: dict[int, list[Triangle]] = defaultdict(list)
     for t in triangles:
-        a, b, c = t
-        for e in (make_edge(a, b), make_edge(b, c), make_edge(a, c)):
-            edge_to_tris[e].append(t)
+        for i in t:
+            if i < n:
+                tris_around[i].append(t)
 
-    segments: list[Segment2D] = []
-    for tris in edge_to_tris.values():
-        if len(tris) != 2:
-            continue                 # outer edge of the super-triangle
-        c1, c2 = triangles[tris[0]][0], triangles[tris[1]][0]
-        seg = clip_segment(c1, c2, width, height)
-        if seg is not None and seg.p1 != seg.p2:
-            segments.append(seg)
-    return segments
+    vertices: list[Point2D] = []
+    vertex_index: dict[tuple[float, float], int] = {}
+
+    def add_vertex(p: Point2D) -> int:
+        key = (round(p.x, decimals) + 0.0, round(p.y, decimals) + 0.0)  # + 0.0 turns -0.0 into 0.0
+        if key not in vertex_index:
+            vertex_index[key] = len(vertices)
+            vertices.append(Point2D(*key))
+        return vertex_index[key]
+
+    cells: list[list[int]] = []
+    edges: set[Edge] = set()
+    for i, site in enumerate(points):
+        centers = [triangles[t][0] for t in tris_around[i]]
+        centers.sort(key=lambda c: math.atan2(c.y - site.y, c.x - site.x))
+        polygon = _clip_polygon(centers, width, height)
+
+        cell: list[int] = []
+        for p in polygon:
+            v = add_vertex(p)
+            if not cell or cell[-1] != v:               # drop repeated vertices
+                cell.append(v)
+        if len(cell) > 1 and cell[0] == cell[-1]:
+            cell.pop()
+        cells.append(cell)
+
+        for k in range(len(cell)):
+            a, b = cell[k], cell[(k + 1) % len(cell)]
+            if a != b:
+                edges.add(make_edge(a, b))
+
+    delaunay_tris = [t for t in triangles if max(t) < n]
+    diagram = VoronoiDiagram(list(points), vertices, sorted(edges), cells)
+    return delaunay_tris, diagram
+
+
+def voronoi(points: list[Point2D], width: float, height: float) -> VoronoiDiagram:
+    """Indexed Voronoi diagram of points, clipped to the wall rectangle."""
+    return delaunay_voronoi(points, width, height)[1]
 
 
 # ---------------------------------------------------------------- plotting
 
-def plot(points: list[Point2D], triangles: list[Triangle], segments: list[Segment2D],
+def plot(points: list[Point2D], triangles: list[Triangle], diagram: VoronoiDiagram,
          width: float, height: float) -> None:
     from matplotlib import pyplot as plt
 
@@ -226,10 +283,10 @@ def plot(points: list[Point2D], triangles: list[Triangle], segments: list[Segmen
         xs = [points[i].x for i in (a, b, c, a)]
         ys = [points[i].y for i in (a, b, c, a)]
         ax.plot(xs, ys, color="tab:blue", linewidth=0.8, alpha=0.6)
-    for s in segments:
-        ax.plot([s.p1.x, s.p2.x], [s.p1.y, s.p2.y], color="tab:red", linewidth=1.2)
+    for a, b in diagram.edges:
+        p, q = diagram.vertices[a], diagram.vertices[b]
+        ax.plot([p.x, q.x], [p.y, q.y], color="tab:red", linewidth=1.2)
     ax.scatter([p.x for p in points], [p.y for p in points], color="black", s=12, zorder=3)
-    ax.plot([0, width, width, 0, 0], [0, 0, height, height, 0], color="gray")
     ax.set_aspect("equal")
     ax.set_title("Delaunay (blue) and Voronoi (red)")
     plt.show()
@@ -238,7 +295,7 @@ def plot(points: list[Point2D], triangles: list[Triangle], segments: list[Segmen
 if __name__ == "__main__":
     W, H = 10, 10
     pts = poisson_sampling(W, H, 1.0, 60, max_tries=100, seed=0)
-    tris = delaunay(pts, W, H)
-    segs = voronoi(pts, W, H)
-    print(f"{len(pts)} points, {len(tris)} triangles, {len(segs)} Voronoi edges")
-    plot(pts, tris, segs, W, H)
+    tris, diagram = delaunay_voronoi(pts, W, H)
+    print(f"{len(pts)} points, {len(tris)} triangles, "
+          f"{len(diagram.vertices)} Voronoi vertices, {len(diagram.edges)} edges")
+    plot(pts, tris, diagram, W, H)

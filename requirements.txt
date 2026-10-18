@@ -6,6 +6,7 @@ kiwisolver==1.5.1
 matplotlib==3.11.2
 numpy==2.5.4
 packaging==26.3
+perlin-noise==1.13
 pillow==13.0.0
 pyparsing==3.3.3
 python-dateutil==2.9.0.post0
